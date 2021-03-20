@@ -1,7 +1,6 @@
 package main
 
 import (
-	"context"
 	"crypto/md5"
 	"find-duplicates/set"
 	"flag"
@@ -15,11 +14,12 @@ import (
 )
 
 var (
-	path       *string
-	fileHashes = set.NewStringStringSet()
-	duplicates = set.NewStringSliceSet()
-	dirsWG     = new(sync.WaitGroup)
-	filesWG    = new(sync.WaitGroup)
+	path         *string
+	fileHashes   = set.NewStringStringSet()
+	duplicates   = set.NewStringSliceSet()
+	dirsWG       = new(sync.WaitGroup)
+	stop         = make(chan struct{}, 1)
+	files_buffer = 100
 )
 
 func init() {
@@ -28,7 +28,7 @@ func init() {
 }
 
 func main() {
-	fileNames := make(chan string)
+	fileNames := make(chan string, files_buffer)
 	dirsDone := make(chan struct{}, 1)
 	filesDone := make(chan struct{}, 1)
 	errors := make(chan error, 1)
@@ -36,12 +36,11 @@ func main() {
 		close(fileNames)
 		close(dirsDone)
 		close(errors)
+		close(stop)
 	}()
-	ctx, cancel := context.WithCancel(context.Background())
 	dirsWG.Add(1)
-	go ReadDir(*path, fileNames, errors, ctx)
-	filesWG.Add(1)
-	go RunFiles(fileNames, errors, ctx, dirsDone, filesDone)
+	go ReadDir(*path, fileNames, errors)
+	go RunFiles(fileNames, errors, dirsDone, filesDone)
 
 	go func() {
 		for true {
@@ -49,7 +48,7 @@ func main() {
 			case err := <-errors:
 				if err != nil {
 					log.Printf("error: %+v", err)
-					cancel()
+					stop <- struct{}{}
 				}
 			default:
 				runtime.Gosched()
@@ -57,13 +56,17 @@ func main() {
 		}
 	}()
 	dirsWG.Wait()
+	fmt.Println("Dirs done!")
 	dirsDone <- struct{}{}
 Loop:
 	for true {
 		select {
-		case <-ctx.Done():
+		case <-stop:
+			fmt.Println("Loop, stop")
+			stop <- struct{}{}
 			return
 		case <-filesDone:
+			fmt.Println("Loop, break")
 			break Loop
 		default:
 			runtime.Gosched()
@@ -72,10 +75,12 @@ Loop:
 	duplicates.Print()
 }
 
-func ReadDir(dirName string, fileNames chan string, errors chan error, ctx context.Context) {
+func ReadDir(dirName string, fileNames chan string, errors chan error) {
 	defer dirsWG.Done()
 	select {
-	case <-ctx.Done():
+	case <-stop:
+		fmt.Println("ReadDir, stop", dirName)
+		stop <- struct{}{}
 		return
 	default:
 		fileInfos, err := ioutil.ReadDir(dirName)
@@ -87,33 +92,42 @@ func ReadDir(dirName string, fileNames chan string, errors chan error, ctx conte
 		for _, fi := range fileInfos {
 			if fi.IsDir() {
 				dirsWG.Add(1)
-				go ReadDir(dirName+string(os.PathSeparator)+fi.Name(), fileNames, errors, ctx)
+				go ReadDir(dirName+string(os.PathSeparator)+fi.Name(), fileNames, errors)
 			} else {
 				location := dirName + string(os.PathSeparator) + fi.Name()
-				fileNames <- location
+				select {
+				case <-stop:
+					fmt.Println("ReadDir, stop", dirName)
+					stop <- struct{}{}
+				default:
+					fileNames <- location
+				}
 			}
 		}
 		return
 	}
 }
 
-func RunFiles(fileNames chan string, errors chan error, ctx context.Context, dirsDone chan struct{}, filesDone chan struct{}) {
+func RunFiles(fileNames chan string, errors chan error, dirsDone chan struct{}, filesDone chan struct{}) {
 	wg := sync.WaitGroup{}
+Loop:
 	for true {
 		select {
-		case <-ctx.Done():
+		case <-stop:
+			fmt.Println("RunFiles, stop")
+			stop <- struct{}{}
 			return
 		case location := <-fileNames:
 			wg.Add(1)
 			go HashFile(location, &wg, errors)
 		case <-dirsDone:
-			wg.Wait()
-			filesDone <- struct{}{}
-			return
+			break Loop
 		default:
 			runtime.Gosched()
 		}
 	}
+	wg.Wait()
+	filesDone <- struct{}{}
 }
 
 func HashFile(location string, wg *sync.WaitGroup, errors chan error) {
