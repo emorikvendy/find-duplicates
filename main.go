@@ -9,18 +9,20 @@ import (
 	"io"
 	"io/ioutil"
 	"os"
+	"runtime/debug"
 	"sync"
+	"time"
 )
 
 var (
-	path         *string
-	fileHashes   = set.NewStringStringSet()
-	duplicates   = set.NewStringSliceSet()
-	dirsWG       = new(sync.WaitGroup)
-	stop         = make(chan struct{}, 1)
-	files_buffer = 100
-	logLevel     *uint
-	logger       *log.Logger
+	path        *string
+	fileHashes  = set.NewStringStringSet()
+	duplicates  = set.NewStringSliceSet()
+	dirsWG      = new(sync.WaitGroup)
+	stop        = make(chan struct{}, 1)
+	filesBuffer = 100
+	logLevel    *uint
+	logger      *log.Logger
 )
 
 func init() {
@@ -38,13 +40,14 @@ func init() {
 }
 
 func main() {
-	fileNames := make(chan string, files_buffer)
-	dirsDone := make(chan struct{}, 1)
-	filesDone := make(chan struct{}, 1)
-	errors := make(chan error, 1)
 	fields := log.Fields{
 		"function": "main",
 	}
+	defer recoverPanic(fields)
+	fileNames := make(chan string, filesBuffer)
+	dirsDone := make(chan struct{}, 1)
+	filesDone := make(chan struct{}, 1)
+	errors := make(chan error, 1)
 	defer func() {
 		close(fileNames)
 		close(dirsDone)
@@ -56,6 +59,9 @@ func main() {
 	go RunFiles(fileNames, errors, dirsDone, filesDone)
 
 	go func() {
+		fields := log.Fields{
+			"function": "main@anonymous",
+		}
 		select {
 		case err := <-errors:
 			if err != nil {
@@ -65,9 +71,13 @@ func main() {
 		case <-filesDone:
 			logger.WithFields(fields).Debug("all files have been processed")
 			filesDone <- struct{}{}
+		case <-stop:
+			logger.WithFields(fields).Debug("stop signal received")
+			stop <- struct{}{}
 		}
 	}()
 	dirsWG.Wait()
+	time.Sleep(time.Second * 2)
 	logger.WithFields(fields).Debug("dirs done")
 	dirsDone <- struct{}{}
 	select {
@@ -87,6 +97,7 @@ func ReadDir(dirName string, fileNames chan string, errors chan error) {
 		"function": "ReadDir",
 		"path":     dirName,
 	}
+	defer recoverPanic(fields)
 	select {
 	case <-stop:
 		logger.WithFields(fields).Debug("stop signal received")
@@ -123,6 +134,7 @@ func RunFiles(fileNames chan string, errors chan error, dirsDone chan struct{}, 
 	fields := log.Fields{
 		"function": "RunFiles",
 	}
+	defer recoverPanic(fields)
 Loop:
 	for true {
 		select {
@@ -145,13 +157,20 @@ Loop:
 }
 
 func HashFile(location string, wg *sync.WaitGroup, errors chan error) {
-	defer wg.Done()
-	f, err := os.Open(location)
-	fileds := log.Fields{
+	fields := log.Fields{
 		"path":     location,
 		"function": "HashFile",
 	}
-	logger.WithFields(fileds).Info("started parsing the file")
+	defer func() {
+		wg.Done()
+		logger.WithFields(fields).Info("finished parsing the file")
+	}()
+	defer recoverPanic(fields)
+	if location == "/home/eol/data/inner_folder_1/inner_folder_1/4.txt" {
+		panic("something went wrong")
+	}
+	f, err := os.Open(location)
+	logger.WithFields(fields).Info("started parsing the file")
 	if err != nil {
 		errors <- err
 		return
@@ -165,7 +184,7 @@ func HashFile(location string, wg *sync.WaitGroup, errors chan error) {
 	key := fmt.Sprintf("%x", h.Sum(nil))
 	//fmt.Println(key, location)
 	if fileHashes.Has(key) {
-		logger.WithFields(fileds).Debug("the file is a duplicate")
+		logger.WithFields(fields).Debug("the file is a duplicate")
 		if duplicates.Has(key) {
 			duplicates.Append(key, location)
 		} else {
@@ -173,7 +192,14 @@ func HashFile(location string, wg *sync.WaitGroup, errors chan error) {
 			duplicates.Add(key, []string{oldLocation, location})
 		}
 	} else {
-		logger.WithFields(fileds).Debug("the file is currently unique")
+		logger.WithFields(fields).Debug("the file is currently unique")
 		fileHashes.Add(key, location)
+	}
+}
+
+func recoverPanic(fields log.Fields) {
+	if r := recover(); r != nil {
+		logger.WithFields(fields).WithField("stack", string(debug.Stack())).Fatal("there was a panic")
+		stop <- struct{}{}
 	}
 }
